@@ -39,6 +39,8 @@
 #define EXAMPLE_WIFI_PASS "3B5!069q"
 // #define EXAMPLE_WIFI_SSID "Ondra"
 // #define EXAMPLE_WIFI_PASS "Kuklenda5632"
+// #define EXAMPLE_WIFI_SSID "wifi-free"
+// #define EXAMPLE_WIFI_PASS ""
 
 // IBM MQTT credentials: token rgpCKDpsJA76OgV7zI
 // #define MQTT_HOST "mqtt://p28mg8.messaging.internetofthings.ibmcloud.com"
@@ -47,6 +49,7 @@
 // #define MQTT_PORT 1883
 // #define MQTT_PORT_CHAR "1883"
 // #define MQTT_CLIENT_ID "d:p28mg8:ESP32:office"
+// #define MQTT_TOPIC_IBM "iot-2/evt/reading/fmt/json"
 
 // ubidots MQTT credentials:
 #define MQTT_HOST "mqtt://things.ubidots.com"
@@ -55,6 +58,8 @@
 #define MQTT_PORT 1883
 #define MQTT_PORT_CHAR "1883"
 #define MQTT_CLIENT_ID "ESP32:office"
+
+// static char MQTT_TOPIC_UBIDOTS[64];
 
 /* FreeRTOS event group to signal when we are connected & ready to make a request */
 static EventGroupHandle_t wifi_event_group;
@@ -110,7 +115,6 @@ typedef struct VIDABeacon {
   int averageRSSI;
 } VIDABeacon;
 
-// static void send_data(VIDABeacon *beacon);
 
 // MQTT callback functions for esp_mqtt.h
 static void status_callback(esp_mqtt_status_t status) {
@@ -129,18 +133,7 @@ static void status_callback(esp_mqtt_status_t status) {
 }
 
 static void message_callback(const char *topic, uint8_t *payload, size_t len) {
-  ESP_LOGI("test", "incoming: %s => %s (%d)", topic, payload, (int)len);
-}
-
-static void send_data(VIDABeacon *beacon) {
-  cJSON *root = NULL;
-  char *out = NULL;
-  root = cJSON_CreateObject();
-  cJSON_AddItemToObject(root, beacon->address, cJSON_CreateNumber(beacon->averageRSSI));
-  out = cJSON_Print(root);
-  ESP_LOGI(MQTT_TAG, "Json length: %d\nJson: %s", strlen(out), out);
-  // esp_mqtt_client_publish(mqttclient, "/v1.6/devices/ESP32:office", out, strlen(out), 2, false);  // ubidots style topic
-  esp_mqtt_publish("/v1.6/devices/ESP32:office", (uint8_t *)out, strlen(out), 1, false);
+  ESP_LOGI(MQTT_TAG, "incoming: %s => %s (%d)", topic, payload, (int)len);
 }
 
 // static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
@@ -207,8 +200,10 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
     time_t now;
     struct tm timeinfo;
 
+    static uint64_t start = 0;
     static VIDABeacon beacons[50];
     static uint8_t beacons_counter = 0;
+    uint8_t dp_counter = 0;
 
 
     switch (event) {
@@ -229,10 +224,13 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             ESP_LOGE(BLE_TAG, "scan start failed, error status = %x", param->scan_start_cmpl.status);
             break;
         }
-        beacons_counter = 0;
+        dp_counter = 0;
         time(&now);
         localtime_r(&now, &timeinfo);
+        start = (uint64_t) now;
+        start *= 1000;
         ESP_LOGI(BLE_TAG, "scan start success at time: %d:%d:%d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        ESP_LOGI(BLE_TAG, "scan start milliseconds: %llu", start);
 
         break;
     case ESP_GAP_BLE_SCAN_RESULT_EVT: {
@@ -296,18 +294,40 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             break;
           }
         case ESP_GAP_SEARCH_INQ_CMPL_EVT: {
-            ESP_LOGI(BLE_TAG, "Found %d VIDA! beacons", beacons_counter);
+            cJSON *root = cJSON_CreateObject();
+
             for (size_t i = 0; i < beacons_counter; i++) {
-              beacons[i].averageRSSI = beacons[i].sumRSSI / beacons[i].times_found;
-              ESP_LOGI(BLE_TAG, "Found %s %d times with %d average RSSI and with ID %d belonging to group %d and address %s",
-                            beacons[i].name, beacons[i].times_found, beacons[i].averageRSSI, beacons[i].individualID, beacons[i].groupID, beacons[i].address);
-              ESP_LOGI(BLE_TAG, "%s is %s, %s to a school group, %s VIDArd and belongs to age group number %d\n",
-                            beacons[i].name, beacons[i].male ? "male" : "female",
-                            beacons[i].school_group ? "belongs" : "doesn`t belong",
-                            beacons[i].VIDArd ? "solves" : "doesn`t solve",
-                            beacons[i].age_group);
-              send_data(&beacons[i]);
+              if (beacons[i].times_found > 0) {
+                beacons[i].averageRSSI = beacons[i].sumRSSI / beacons[i].times_found;
+                ESP_LOGI(BLE_TAG, "Found %s %d times with %d average RSSI and with ID %d belonging to group %d and address %s",
+                              beacons[i].name, beacons[i].times_found, beacons[i].averageRSSI, beacons[i].individualID, beacons[i].groupID, beacons[i].address);
+                ESP_LOGI(BLE_TAG, "%s is %s, %s to a school group, %s VIDArd and belongs to age group number %d\n",
+                              beacons[i].name, beacons[i].male ? "male" : "female",
+                              beacons[i].school_group ? "belongs" : "doesn`t belong",
+                              beacons[i].VIDArd ? "solves" : "doesn`t solve",
+                              beacons[i].age_group);
+                cJSON *value = NULL;
+                value = cJSON_CreateObject();
+                cJSON_AddNumberToObject(value, "value", beacons[i].averageRSSI);
+                cJSON_AddNumberToObject(value, "timestamp", start);
+                cJSON_AddItemToObject(root, beacons[i].address, value);
+
+                beacons[i].times_found = 0;
+                beacons[i].sumRSSI = 0;
+
+                dp_counter++;
+              }
             }
+
+            ESP_LOGI(BLE_TAG, "Found %d VIDA! beacons", dp_counter);
+            if (dp_counter > 0) {
+              char *out = NULL;
+              out = cJSON_Print(root);
+              ESP_LOGI(MQTT_TAG, "Json length: %d\nJson: %s", strlen(out), out);
+              // esp_mqtt_client_publish(mqttclient, "/v1.6/devices/ESP32:office", out, strlen(out), 2, false);  // ubidots style topic
+              esp_mqtt_publish("/v1.6/devices/ESP32:office", (uint8_t *)out, strlen(out), 1, false);
+            }
+
             time(&now);
             localtime_r(&now, &timeinfo);
             ESP_LOGI(BLE_TAG, "Search inquire complete at time: %d:%d:%d.", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
@@ -501,7 +521,7 @@ void app_main()
     tzset();
     localtime_r(&now, &timeinfo);
     strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-    ESP_LOGI(WIFI_TAG, "The current date/time in Brno is: %s", strftime_buf);
+    ESP_LOGI(WIFI_TAG, "The current date/time in Brno is: %s.", strftime_buf);
 
     initialize_ble();
 
