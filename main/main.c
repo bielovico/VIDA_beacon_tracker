@@ -35,10 +35,8 @@
 #define MQTT_TAG "MQTT"
 // #define EXAMPLE_WIFI_SSID CONFIG_WIFI_SSID
 // #define EXAMPLE_WIFI_PASS CONFIG_WIFI_PASSWORD
-#define EXAMPLE_WIFI_SSID "OlVeNotebookHotspot"
-#define EXAMPLE_WIFI_PASS "3B5!069q"
-// #define EXAMPLE_WIFI_SSID "Ondra"
-// #define EXAMPLE_WIFI_PASS "Kuklenda5632"
+#define EXAMPLE_WIFI_SSID "OlVeHotspot"
+#define EXAMPLE_WIFI_PASS "1ViBDzr1ZK"
 // #define EXAMPLE_WIFI_SSID "wifi-free"
 // #define EXAMPLE_WIFI_PASS ""
 
@@ -57,7 +55,7 @@
 #define MQTT_PASS " "
 #define MQTT_PORT 1883
 #define MQTT_PORT_CHAR "1883"
-#define MQTT_CLIENT_ID "ESP32:office"
+#define MQTT_CLIENT_ID "ESP32:Civi:Ostrov"
 
 // static char MQTT_TOPIC_UBIDOTS[64];
 
@@ -230,7 +228,13 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         start = (uint64_t) now;
         start *= 1000;
         ESP_LOGI(BLE_TAG, "scan start success at time: %d:%d:%d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-        ESP_LOGI(BLE_TAG, "scan start milliseconds: %llu", start);
+        if (timeinfo.tm_sec == 0) {  // send alive confirmation every minute
+          char alive[64] = "/v1.6/devices/";
+          strcat(alive, MQTT_CLIENT_ID);
+          strcat(alive, "/alive");
+          esp_mqtt_publish(alive, (uint8_t *) "{\"value\":true}", 14, 1, false);
+        }
+
 
         break;
     case ESP_GAP_BLE_SCAN_RESULT_EVT: {
@@ -240,18 +244,18 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             bit16_UUID = esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
                                             ESP_BLE_AD_TYPE_16SRV_CMPL, &bit16_UUID_len);
             if (bit16_UUID_len == 0 || memcmp(bit16_UUID, bit16_UUID_Eddystone, bit16_UUID_len) != 0) {
-              ESP_LOGI(BLE_TAG, "Not EddyStone!");
+              // ESP_LOGI(BLE_TAG, "Not EddyStone!");
               break;  // Ignore not eddystone beacons
             }
             service_data = esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
                                              ESP_BLE_AD_TYPE_SERVICE_DATA, &service_data_len);
             if (service_data_len == 0 || memcmp(service_data, service_data_EddystoneUID, 3) != 0) {
-              ESP_LOGI(BLE_TAG, "Not EddyStoneUID!");
+              // ESP_LOGI(BLE_TAG, "Not EddyStoneUID!");
               break;  // ignore eddystone beacons other than UID
             }
             name_space = service_data + 4;
             if (memcmp(name_space, name_space_VIDA, 10) != 0) {
-              ESP_LOGI(BLE_TAG, "Not VIDA! EddyStoneUID!");
+              // ESP_LOGI(BLE_TAG, "Not VIDA! EddyStoneUID!");
               break;  // Ignore EddyStoneUID beacons with different name_space
             }
             instance = name_space + 10;
@@ -299,13 +303,13 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             for (size_t i = 0; i < beacons_counter; i++) {
               if (beacons[i].times_found > 0) {
                 beacons[i].averageRSSI = beacons[i].sumRSSI / beacons[i].times_found;
-                ESP_LOGI(BLE_TAG, "Found %s %d times with %d average RSSI and with ID %d belonging to group %d and address %s",
-                              beacons[i].name, beacons[i].times_found, beacons[i].averageRSSI, beacons[i].individualID, beacons[i].groupID, beacons[i].address);
-                ESP_LOGI(BLE_TAG, "%s is %s, %s to a school group, %s VIDArd and belongs to age group number %d\n",
-                              beacons[i].name, beacons[i].male ? "male" : "female",
-                              beacons[i].school_group ? "belongs" : "doesn`t belong",
-                              beacons[i].VIDArd ? "solves" : "doesn`t solve",
-                              beacons[i].age_group);
+                // ESP_LOGI(BLE_TAG, "Found %s %d times with %d average RSSI and with ID %d belonging to group %d and address %s",
+                //               beacons[i].name, beacons[i].times_found, beacons[i].averageRSSI, beacons[i].individualID, beacons[i].groupID, beacons[i].address);
+                // ESP_LOGI(BLE_TAG, "%s is %s, %s to a school group, %s VIDArd and belongs to age group number %d\n",
+                //               beacons[i].name, beacons[i].male ? "male" : "female",
+                //               beacons[i].school_group ? "belongs" : "doesn`t belong",
+                //               beacons[i].VIDArd ? "solves" : "doesn`t solve",
+                //               beacons[i].age_group);
                 cJSON *value = NULL;
                 value = cJSON_CreateObject();
                 cJSON_AddNumberToObject(value, "value", beacons[i].averageRSSI);
@@ -324,8 +328,10 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
               char *out = NULL;
               out = cJSON_Print(root);
               ESP_LOGI(MQTT_TAG, "Json length: %d\nJson: %s", strlen(out), out);
+              char topic[64] = "/v1.6/devices/";
+              strcat(topic, MQTT_CLIENT_ID);
               // esp_mqtt_client_publish(mqttclient, "/v1.6/devices/ESP32:office", out, strlen(out), 2, false);  // ubidots style topic
-              esp_mqtt_publish("/v1.6/devices/ESP32:office", (uint8_t *)out, strlen(out), 1, false);
+              esp_mqtt_publish(topic, (uint8_t *)out, strlen(out), 1, false);
             }
 
             time(&now);
@@ -434,6 +440,7 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
         break;
     case SYSTEM_EVENT_STA_GOT_IP:
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        esp_mqtt_start(MQTT_HOST, MQTT_PORT_CHAR, MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);
         break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
         /* This is a workaround as ESP32 WiFi libs don't currently
@@ -441,6 +448,7 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
         esp_mqtt_stop();
         esp_wifi_connect();
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        xEventGroupClearBits(wifi_event_group, MQTT_CONNECTED_BIT);
         break;
     default:
         break;
@@ -492,14 +500,15 @@ void app_main()
     }
     ESP_ERROR_CHECK( ret );
 
+
+    esp_mqtt_init(status_callback, message_callback, 256, 2000);
     initialize_wifi();
     ESP_ERROR_CHECK( esp_wifi_start() );
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
                         false, true, portMAX_DELAY);
 
     // mqttclient = mqtt_app_start();
-    esp_mqtt_init(status_callback, message_callback, 256, 2000);
-    esp_mqtt_start(MQTT_HOST, MQTT_PORT_CHAR, MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);
+    // esp_mqtt_start(MQTT_HOST, MQTT_PORT_CHAR, MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);
     xEventGroupWaitBits(wifi_event_group, MQTT_CONNECTED_BIT,
                         false, true, portMAX_DELAY);
 
