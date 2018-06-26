@@ -21,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 
 #include "lwip/err.h"
 #include "apps/sntp/sntp.h"
@@ -50,21 +51,27 @@
 // #define MQTT_TOPIC_IBM "iot-2/evt/reading/fmt/json"
 
 // ubidots MQTT credentials:
-#define MQTT_HOST "mqtt://things.ubidots.com"
-#define MQTT_USER "A1E-Cg5BcJyCyq9AImrvvG08MlYmxydLD2"
+// #define MQTT_HOST "mqtt://things.ubidots.com"
+// #define MQTT_USER "A1E-Cg5BcJyCyq9AImrvvG08MlYmxydLD2"
+// #define MQTT_PASS " "
+// #define MQTT_PORT 1883
+// #define MQTT_PORT_CHAR "1883"
+// #define MQTT_CLIENT_ID "ESP32:Office:Testing"
+
+// VIDA mosquitto MQTT credentials
+#define MQTT_HOST "192.168.0.99"
+#define MQTT_USER " "
 #define MQTT_PASS " "
 #define MQTT_PORT 1883
 #define MQTT_PORT_CHAR "1883"
-#define MQTT_CLIENT_ID "ESP32:Civi:Ostrov"
-
-// static char MQTT_TOPIC_UBIDOTS[64];
+#define MQTT_CLIENT_ID "office"
 
 /* FreeRTOS event group to signal when we are connected & ready to make a request */
 static EventGroupHandle_t wifi_event_group;
 /* The event group allows multiple bits for each event,
    but we only care about one event - are we connected
    to the AP with an IP? */
-const int WIFI_CONNECTED_BIT = BIT0;
+  const int WIFI_CONNECTED_BIT = BIT0;
 const int MQTT_CONNECTED_BIT = BIT1;
 /* Variable holding number of times ESP32 restarted since first boot.
  * It is placed into RTC memory using RTC_DATA_ATTR and
@@ -77,7 +84,11 @@ const int MQTT_CONNECTED_BIT = BIT1;
 static const uint8_t bit16_UUID_Eddystone[2] = {0xaa, 0xfe};
 static const uint8_t service_data_EddystoneUID[3] = {0xaa, 0xfe, 0x00};
 static const uint8_t name_space_VIDA[10] = {0xec, 0x0c, 0xb4, 0xca, 0x9f, 0xa6, 0x84, 0xd6, 0xab, 0xbf};
-static const uint8_t duration = 4;
+static const uint8_t duration = 5;
+
+
+// queue of JSON results
+QueueHandle_t results_queue;
 
 /* declare static functions */
 static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
@@ -99,18 +110,20 @@ static esp_ble_scan_params_t ble_scan_params = {
 typedef struct VIDABeacon {
   uint8_t bda[6];
   char address[12];
-  char name[29];
-  uint16_t groupID;
-  uint8_t individualID;
-  uint8_t demographic;
-  uint16_t reserved;
-  bool male;
-  bool school_group;
-  bool VIDArd;
-  uint8_t age_group;
+  uint8_t instance[6];
+  char visitor[12];
+  // char name[29];
+  // uint16_t groupID;
+  // uint8_t individualID;
+  // uint8_t demographic;
+  // uint16_t reserved;
+  // bool male;
+  // bool school_group;
+  // bool VIDArd;
+  // uint8_t age_group;
   int sumRSSI;
   uint8_t times_found;
-  int averageRSSI;
+  // int averageRSSI;
 } VIDABeacon;
 
 
@@ -132,6 +145,35 @@ static void status_callback(esp_mqtt_status_t status) {
 
 static void message_callback(const char *topic, uint8_t *payload, size_t len) {
   ESP_LOGI(MQTT_TAG, "incoming: %s => %s (%d)", topic, payload, (int)len);
+}
+
+static void publish_task(void * pvParameters) {
+  char topic[64] = "observers/";
+  strcat(topic, MQTT_CLIENT_ID);
+  strcat(topic, "/observations")
+  bool published;
+  cJSON *result;
+  char *out;
+  BaseType_t xStatus;
+  const TickType_t xTicksToWait = pdMS_TO_TICKS( 5000 );
+  for ( ; ; ) {
+    xStatus = xQueueReceive( results_queue, &result, xTicksToWait );
+    if (xStatus == pdPASS) {
+      // esp_mqtt_client_publish(mqttclient, "/v1.6/devices/ESP32:office", out, strlen(out), 2, false);
+      out = cJSON_Print(result);
+      // ESP_LOGI(MQTT_TAG, "Json length: %d\nJson: %s", strlen(out), out);
+      published = esp_mqtt_publish(topic, (uint8_t *)out, strlen(out), 1, true);
+      while (!published) {
+        ESP_LOGI(MQTT_TAG, "Couldn`t publish, try again after reconnecting!");
+        xEventGroupWaitBits(wifi_event_group, MQTT_CONNECTED_BIT,
+                            false, true, portMAX_DELAY);
+        published = esp_mqtt_publish(topic, (uint8_t *)out, strlen(out), 1, true);
+        // ESP_LOGI(MQTT_TAG, "Tried publishing again.");
+      }
+      ESP_LOGI(MQTT_TAG, "Published! %s", out);
+      cJSON_Delete(result);
+    }
+  }
 }
 
 // static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
@@ -187,8 +229,8 @@ static void message_callback(const char *topic, uint8_t *payload, size_t len) {
 
 static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
-    uint8_t *adv_name = NULL;
-    uint8_t adv_name_len = 0;
+    // uint8_t *adv_name = NULL;
+    // uint8_t adv_name_len = 0;
     uint8_t *bit16_UUID = NULL;
     uint8_t bit16_UUID_len = 0;
     uint8_t *service_data = NULL;
@@ -228,14 +270,12 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         start = (uint64_t) now;
         start *= 1000;
         ESP_LOGI(BLE_TAG, "scan start success at time: %d:%d:%d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-        if (timeinfo.tm_sec == 0) {  // send alive confirmation every minute
-          char alive[64] = "/v1.6/devices/";
-          strcat(alive, MQTT_CLIENT_ID);
-          strcat(alive, "/alive");
-          esp_mqtt_publish(alive, (uint8_t *) "{\"value\":true}", 14, 1, false);
-        }
-
-
+        // if (timeinfo.tm_sec == 0) {  // send alive confirmation every minute
+        //   char alive[64] = "/v1.6/devices/";
+        //   strcat(alive, MQTT_CLIENT_ID);
+        //   strcat(alive, "/alive");
+        //   esp_mqtt_publish(alive, (uint8_t *) "{\"value\":true}", 14, 1, false);
+        // }
         break;
     case ESP_GAP_BLE_SCAN_RESULT_EVT: {
         esp_ble_gap_cb_param_t *scan_result = (esp_ble_gap_cb_param_t *)param;
@@ -269,16 +309,32 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
               }
             }
             if (found == true) {
-              ESP_LOGI(BLE_TAG, "Found beacon updated.");
+              if (memcmp(instance, beacons[i].instance, 6) != 0) {
+                char topic[64] = "beacons/";
+                strcat(topic, beacons[i].address);
+                strcat(topic, "/visitors");
+                cJSON *root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "id", beacons[i].visitor);
+                cJSON_AddNumberToObject(root, "timestamp", start);
+                char* out = cJSON_Print(root);
+                esp_mqtt_publish(topic, (uint8_t *)out, strlen(out), 1, true);
+                memcpy(beacons[i].instance, instance, 6);
+                sprintf(beacons[beacons_counter].visitor, "%x%x%x%x%x%x", instance[0],
+                              instance[1], instance[2], instance[3], instance[4], instance[5]);
+              }
+              // ESP_LOGI(BLE_TAG, "Found beacon updated.");
               beacons[i].sumRSSI += scan_result->scan_rst.rssi;
               beacons[i].times_found++;
             } else {
-              ESP_LOGI(BLE_TAG,"New Beacon discovered.");
+              // ESP_LOGI(BLE_TAG,"New Beacon discovered.");
               memcpy(beacons[beacons_counter].bda, scan_result->scan_rst.bda, 6);
               sprintf(beacons[beacons_counter].address, "%x%x%x%x%x%x", beacons[beacons_counter].bda[0],
                            beacons[beacons_counter].bda[1], beacons[beacons_counter].bda[2],
                           beacons[beacons_counter].bda[3], beacons[beacons_counter].bda[4],
                          beacons[beacons_counter].bda[5]);
+              memcpy(beacons[beacons_counter].id, instance, 6);
+              sprintf(beacons[beacons_counter].visitor, "%x%x%x%x%x%x", instance[0],
+                            instance[1], instance[2], instance[3], instance[4], instance[5]);
               adv_name = esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
                                                   ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
               strncpy(beacons[beacons_counter].name, (char *)adv_name, adv_name_len);
@@ -325,18 +381,15 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
 
             ESP_LOGI(BLE_TAG, "Found %d VIDA! beacons", dp_counter);
             if (dp_counter > 0) {
-              char *out = NULL;
-              out = cJSON_Print(root);
-              ESP_LOGI(MQTT_TAG, "Json length: %d\nJson: %s", strlen(out), out);
-              char topic[64] = "/v1.6/devices/";
-              strcat(topic, MQTT_CLIENT_ID);
-              // esp_mqtt_client_publish(mqttclient, "/v1.6/devices/ESP32:office", out, strlen(out), 2, false);  // ubidots style topic
-              esp_mqtt_publish(topic, (uint8_t *)out, strlen(out), 1, false);
+              if( xQueueSendToBack( results_queue, &root, ( TickType_t ) 10 ) != pdPASS ) {
+                ESP_LOGW(WIFI_TAG, "Could not add JSON to queue!");
+                esp_restart(); // probably could not reconnect to WiFi
+              }
             }
 
             time(&now);
             localtime_r(&now, &timeinfo);
-            ESP_LOGI(BLE_TAG, "Search inquire complete at time: %d:%d:%d.", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            // ESP_LOGI(BLE_TAG, "Search inquire complete at time: %d:%d:%d.", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
             while (timeinfo.tm_sec % 5 != 0) {
               vTaskDelay(100 / portTICK_PERIOD_MS);
               time(&now);
@@ -534,11 +587,20 @@ void app_main()
 
     initialize_ble();
 
+    results_queue = xQueueCreate(60, sizeof(cJSON *));
+    if (results_queue == 0) {
+      ESP_LOGI(WIFI_TAG, "Could not allocate a queue!");
+    }
+
     // set ble scan parameters and start scanning afterwards
     esp_err_t scan_ret = esp_ble_gap_set_scan_params(&ble_scan_params);
     if (scan_ret){
         ESP_LOGE(BLE_TAG, "set scan params error, error code = %x", scan_ret);
     }  // scanning starts after parameters are set (see callback function)
+
+
+    xTaskCreatePinnedToCore(publish_task, "Publish", 3000, NULL, tskIDLE_PRIORITY, NULL, 1);
+    // ESP_LOGI(BLE_TAG, "Free heap size: %d", xPortGetFreeHeapSize());
 
     ESP_LOGI(BLE_TAG, "Main finished!");
 
