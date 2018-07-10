@@ -84,11 +84,14 @@ const int MQTT_CONNECTED_BIT = BIT1;
 static const uint8_t bit16_UUID_Eddystone[2] = {0xaa, 0xfe};
 static const uint8_t service_data_EddystoneUID[3] = {0xaa, 0xfe, 0x00};
 static const uint8_t name_space_VIDA[10] = {0xec, 0x0c, 0xb4, 0xca, 0x9f, 0xa6, 0x84, 0xd6, 0xab, 0xbf};
-static const uint8_t duration = 5;
+static const uint8_t duration = 2;
 
 
 // queue of JSON results
 QueueHandle_t results_queue;
+
+// queue of beacon IDs
+QueueHandle_t beacons_queue;
 
 /* declare static functions */
 static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
@@ -108,6 +111,8 @@ static esp_ble_scan_params_t ble_scan_params = {
 };
 
 typedef struct VIDABeacon {
+  int sumRSSI;
+  uint8_t times_found;
   uint8_t bda[6];
   char address[12];
   uint8_t instance[6];
@@ -121,8 +126,6 @@ typedef struct VIDABeacon {
   // bool school_group;
   // bool VIDArd;
   // uint8_t age_group;
-  int sumRSSI;
-  uint8_t times_found;
   // int averageRSSI;
 } VIDABeacon;
 
@@ -150,7 +153,9 @@ static void message_callback(const char *topic, uint8_t *payload, size_t len) {
 static void publish_task(void * pvParameters) {
   char topic[64] = "observers/";
   strcat(topic, MQTT_CLIENT_ID);
-  strcat(topic, "/observations")
+  strcat(topic, "/observations");
+  char beacon_topic[64];
+  cJSON *beacon_address;
   bool published;
   cJSON *result;
   char *out;
@@ -171,6 +176,26 @@ static void publish_task(void * pvParameters) {
         // ESP_LOGI(MQTT_TAG, "Tried publishing again.");
       }
       ESP_LOGI(MQTT_TAG, "Published! %s", out);
+      cJSON_Delete(result);
+    }
+    xStatus = xQueueReceive( beacons_queue, &result, ( TickType_t ) 10);
+    if (xStatus == pdPASS) {
+      // esp_mqtt_client_publish(mqttclient, "/v1.6/devices/ESP32:office", out, strlen(out), 2, false);
+      strcpy(beacon_topic, "beacons/");
+      beacon_address = cJSON_DetachItemFromObjectCaseSensitive(result, "address");
+      strcat(beacon_topic, beacon_address->valuestring);
+      strcat(beacon_topic, "/visitors");
+      out = cJSON_Print(result);
+      // ESP_LOGI(MQTT_TAG, "Json length: %d\nJson: %s", strlen(out), out);
+      published = esp_mqtt_publish(beacon_topic, (uint8_t *)out, strlen(out), 1, true);
+      while (!published) {
+        ESP_LOGI(MQTT_TAG, "Couldn`t publish beacon ID, try again after reconnecting!");
+        xEventGroupWaitBits(wifi_event_group, MQTT_CONNECTED_BIT,
+                            false, true, portMAX_DELAY);
+        published = esp_mqtt_publish(beacon_topic, (uint8_t *)out, strlen(out), 1, true);
+        // ESP_LOGI(MQTT_TAG, "Tried publishing again.");
+      }
+      ESP_LOGI(MQTT_TAG, "Published to topic: %s! %s", beacon_topic, out);
       cJSON_Delete(result);
     }
   }
@@ -250,8 +275,8 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
         time(&now);
         localtime_r(&now, &timeinfo);
-        while (timeinfo.tm_sec % 5 != 0) {
-          vTaskDelay(1000 / portTICK_PERIOD_MS);
+        while (timeinfo.tm_sec % duration != 0) {
+          vTaskDelay(500 / portTICK_PERIOD_MS);
           time(&now);
           localtime_r(&now, &timeinfo);
         }
@@ -310,17 +335,18 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             }
             if (found == true) {
               if (memcmp(instance, beacons[i].instance, 6) != 0) {
-                char topic[64] = "beacons/";
-                strcat(topic, beacons[i].address);
-                strcat(topic, "/visitors");
+                memcpy(beacons[i].instance, instance, 6);
+                sprintf(beacons[i].visitor, "%02x%02x%02x%02x%02x%02x", instance[0],
+                              instance[1], instance[2], instance[3], instance[4], instance[5]);
+                ESP_LOGI(WIFI_TAG, "Updated visitor ID: %s on beacon address: %s", beacons[i].visitor, beacons[i].address);
                 cJSON *root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "address", beacons[i].address);
                 cJSON_AddStringToObject(root, "id", beacons[i].visitor);
                 cJSON_AddNumberToObject(root, "timestamp", start);
-                char* out = cJSON_Print(root);
-                esp_mqtt_publish(topic, (uint8_t *)out, strlen(out), 1, true);
-                memcpy(beacons[i].instance, instance, 6);
-                sprintf(beacons[beacons_counter].visitor, "%x%x%x%x%x%x", instance[0],
-                              instance[1], instance[2], instance[3], instance[4], instance[5]);
+                if( xQueueSendToBack( beacons_queue, &root, ( TickType_t ) 10 ) != pdPASS ) {
+                  ESP_LOGW(WIFI_TAG, "Could not add beacon ID to queue! Restarting!");
+                  esp_restart(); // probably could not reconnect to WiFi
+                }
               }
               // ESP_LOGI(BLE_TAG, "Found beacon updated.");
               beacons[i].sumRSSI += scan_result->scan_rst.rssi;
@@ -328,37 +354,52 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             } else {
               // ESP_LOGI(BLE_TAG,"New Beacon discovered.");
               memcpy(beacons[beacons_counter].bda, scan_result->scan_rst.bda, 6);
-              sprintf(beacons[beacons_counter].address, "%x%x%x%x%x%x", beacons[beacons_counter].bda[0],
+              sprintf(beacons[beacons_counter].address, "%02x%02x%02x%02x%02x%02x", beacons[beacons_counter].bda[0],
                            beacons[beacons_counter].bda[1], beacons[beacons_counter].bda[2],
                           beacons[beacons_counter].bda[3], beacons[beacons_counter].bda[4],
                          beacons[beacons_counter].bda[5]);
-              memcpy(beacons[beacons_counter].id, instance, 6);
-              sprintf(beacons[beacons_counter].visitor, "%x%x%x%x%x%x", instance[0],
+              memcpy(beacons[beacons_counter].instance, instance, 6);
+              sprintf(beacons[beacons_counter].visitor, "%02x%02x%02x%02x%02x%02x", instance[0],
                             instance[1], instance[2], instance[3], instance[4], instance[5]);
-              adv_name = esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
-                                                  ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
-              strncpy(beacons[beacons_counter].name, (char *)adv_name, adv_name_len);
+              // adv_name = esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
+              //                                     ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
+              // strncpy(beacons[beacons_counter].name, (char *)adv_name, adv_name_len);
+              ESP_LOGI(WIFI_TAG, "New visitor ID: %s on beacon address: %s", beacons[beacons_counter].visitor, beacons[beacons_counter].address);
               beacons[beacons_counter].sumRSSI = scan_result->scan_rst.rssi;
               beacons[beacons_counter].times_found = 1;
-              beacons[beacons_counter].groupID = ((uint16_t) *instance << 8) | *(instance+1); // first two bytes of instance
-              beacons[beacons_counter].individualID = *(instance+2);  // third byte of instance
-              beacons[beacons_counter].demographic = *(instance+3);  // fourth byte of instance
-              beacons[beacons_counter].reserved = ((uint16_t) *(instance+4) << 8) | *(instance+5); // last two bytes of instance
-              beacons[beacons_counter].male = beacons[beacons_counter].demographic & 0x01; // first bit of demographic is 1; demographic && 0000 0001
-              beacons[beacons_counter].school_group = (beacons[beacons_counter].demographic & 0x02) >> 1;  // second bit of demographic is 1
-              beacons[beacons_counter].VIDArd = (beacons[beacons_counter].demographic & 0x04) >> 2;  // third bit is 1
-              beacons[beacons_counter].age_group = (beacons[beacons_counter].demographic & 0x30) >> 4;  // fifth and sixth bits shifted to right 0011 0000 -> 0000 0011
+              // beacons[beacons_counter].groupID = ((uint16_t) *instance << 8) | *(instance+1); // first two bytes of instance
+              // beacons[beacons_counter].individualID = *(instance+2);  // third byte of instance
+              // beacons[beacons_counter].demographic = *(instance+3);  // fourth byte of instance
+              // beacons[beacons_counter].reserved = ((uint16_t) *(instance+4) << 8) | *(instance+5); // last two bytes of instance
+              // beacons[beacons_counter].male = beacons[beacons_counter].demographic & 0x01; // first bit of demographic is 1; demographic && 0000 0001
+              // beacons[beacons_counter].school_group = (beacons[beacons_counter].demographic & 0x02) >> 1;  // second bit of demographic is 1
+              // beacons[beacons_counter].VIDArd = (beacons[beacons_counter].demographic & 0x04) >> 2;  // third bit is 1
+              // beacons[beacons_counter].age_group = (beacons[beacons_counter].demographic & 0x30) >> 4;  // fifth and sixth bits shifted to right 0011 0000 -> 0000 0011
+              cJSON *root = cJSON_CreateObject();
+              cJSON_AddStringToObject(root, "address", beacons[beacons_counter].address);
+              cJSON_AddStringToObject(root, "id", beacons[beacons_counter].visitor);
+              cJSON_AddNumberToObject(root, "timestamp", start);
+              if( xQueueSendToBack( beacons_queue, &root, ( TickType_t ) 10 ) != pdPASS ) {
+                ESP_LOGE(WIFI_TAG, "Could not add beacon ID to queue! Restarting!");
+                esp_restart(); // probably could not reconnect to WiFi
+              }
 
               beacons_counter++;
             }
             break;
           }
         case ESP_GAP_SEARCH_INQ_CMPL_EVT: {
+            int averageRSSI;
             cJSON *root = cJSON_CreateObject();
+            cJSON_AddNumberToObject(root, "timestamp", start);
+            cJSON *rssi = cJSON_CreateObject();
+            cJSON *times_observed = cJSON_CreateObject();
+            cJSON_AddItemToObject(root, "rssi", rssi);
+            cJSON_AddItemToObject(root, "timesObserved", times_observed);
 
             for (size_t i = 0; i < beacons_counter; i++) {
               if (beacons[i].times_found > 0) {
-                beacons[i].averageRSSI = beacons[i].sumRSSI / beacons[i].times_found;
+                averageRSSI = beacons[i].sumRSSI / beacons[i].times_found;
                 // ESP_LOGI(BLE_TAG, "Found %s %d times with %d average RSSI and with ID %d belonging to group %d and address %s",
                 //               beacons[i].name, beacons[i].times_found, beacons[i].averageRSSI, beacons[i].individualID, beacons[i].groupID, beacons[i].address);
                 // ESP_LOGI(BLE_TAG, "%s is %s, %s to a school group, %s VIDArd and belongs to age group number %d\n",
@@ -366,11 +407,8 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
                 //               beacons[i].school_group ? "belongs" : "doesn`t belong",
                 //               beacons[i].VIDArd ? "solves" : "doesn`t solve",
                 //               beacons[i].age_group);
-                cJSON *value = NULL;
-                value = cJSON_CreateObject();
-                cJSON_AddNumberToObject(value, "value", beacons[i].averageRSSI);
-                cJSON_AddNumberToObject(value, "timestamp", start);
-                cJSON_AddItemToObject(root, beacons[i].address, value);
+                cJSON_AddNumberToObject(rssi, beacons[i].visitor, averageRSSI);
+                cJSON_AddNumberToObject(times_observed, beacons[i].visitor, beacons[i].times_found);
 
                 beacons[i].times_found = 0;
                 beacons[i].sumRSSI = 0;
@@ -380,17 +418,15 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             }
 
             ESP_LOGI(BLE_TAG, "Found %d VIDA! beacons", dp_counter);
-            if (dp_counter > 0) {
-              if( xQueueSendToBack( results_queue, &root, ( TickType_t ) 10 ) != pdPASS ) {
-                ESP_LOGW(WIFI_TAG, "Could not add JSON to queue!");
-                esp_restart(); // probably could not reconnect to WiFi
-              }
+            if( xQueueSendToBack( results_queue, &root, ( TickType_t ) 10 ) != pdPASS ) {
+              ESP_LOGW(WIFI_TAG, "Could not add JSON to queue! Restarting!");
+              esp_restart(); // probably could not reconnect to WiFi
             }
 
             time(&now);
             localtime_r(&now, &timeinfo);
             // ESP_LOGI(BLE_TAG, "Search inquire complete at time: %d:%d:%d.", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-            while (timeinfo.tm_sec % 5 != 0) {
+            while (timeinfo.tm_sec % duration != 0) {
               vTaskDelay(100 / portTICK_PERIOD_MS);
               time(&now);
               localtime_r(&now, &timeinfo);
@@ -587,9 +623,14 @@ void app_main()
 
     initialize_ble();
 
-    results_queue = xQueueCreate(60, sizeof(cJSON *));
+    results_queue = xQueueCreate(120, sizeof(cJSON *));
     if (results_queue == 0) {
-      ESP_LOGI(WIFI_TAG, "Could not allocate a queue!");
+      ESP_LOGI(WIFI_TAG, "Could not allocate a results queue!");
+    }
+
+    beacons_queue = xQueueCreate(120, sizeof(cJSON *));
+    if (beacons_queue == 0) {
+      ESP_LOGI(WIFI_TAG, "Could not allocate a beacons queue!");
     }
 
     // set ble scan parameters and start scanning afterwards
