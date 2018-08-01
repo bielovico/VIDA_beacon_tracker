@@ -18,12 +18,14 @@
 #include "esp_event_loop.h"
 #include "esp_attr.h"
 #include "esp_sleep.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 
 #include "lwip/err.h"
+#include "lwip/ip4_addr.h"
 #include "apps/sntp/sntp.h"
 
 #include <esp_mqtt.h>
@@ -31,15 +33,22 @@
 
 #include "cJSON.h"
 
+#define APP_VERSION "0.9"
+
+#define MAIN_TAG "MAIN"
 #define BLE_TAG "BLE"
 #define WIFI_TAG "WiFi"
 #define MQTT_TAG "MQTT"
-// #define EXAMPLE_WIFI_SSID CONFIG_WIFI_SSID
-// #define EXAMPLE_WIFI_PASS CONFIG_WIFI_PASSWORD
-#define EXAMPLE_WIFI_SSID "OlVeHotspot"
-#define EXAMPLE_WIFI_PASS "1ViBDzr1ZK"
-// #define EXAMPLE_WIFI_SSID "wifi-free"
-// #define EXAMPLE_WIFI_PASS ""
+#define TIMER_TAG "TIMER"
+
+// #define WIFI_SSID CONFIG_WIFI_SSID
+// #define WIFI_PASS CONFIG_WIFI_PASSWORD
+#define WIFI_SSID "OlVeHotspot"
+#define WIFI_PASS "1ViBDzr1ZK"
+#define WIFI_CHANNEL 4
+#define DISCONNECTIONS_LIMIT 15
+// #define WIFI_SSID "wifi-free"
+// #define WIFI_PASS ""
 
 // IBM MQTT credentials: token rgpCKDpsJA76OgV7zI
 // #define MQTT_HOST "mqtt://p28mg8.messaging.internetofthings.ibmcloud.com"
@@ -64,7 +73,12 @@
 #define MQTT_PASS " "
 #define MQTT_PORT 1883
 #define MQTT_PORT_CHAR "1883"
-#define MQTT_CLIENT_ID "office"
+#define MQTT_CLIENT_ID "testing"
+
+#define MQTT_COMMAND_TIMEOUT 6000
+
+#define RESTART_WINDOW_SEC 1200
+#define RESTART_MIN_SEC    1200
 
 /* FreeRTOS event group to signal when we are connected & ready to make a request */
 static EventGroupHandle_t wifi_event_group;
@@ -100,6 +114,7 @@ static void obtain_time(void);
 static void initialize_sntp(void);
 static void initialize_wifi(void);
 static esp_err_t event_handler(void *ctx, system_event_t *event);
+static void restart_timer_callback(void* arg);
 
 
 static esp_ble_scan_params_t ble_scan_params = {
@@ -293,7 +308,7 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         time(&now);
         localtime_r(&now, &timeinfo);
         start = (uint64_t) now;
-        start *= 1000;
+        // start *= 1000; // to get milliseconds
         ESP_LOGI(BLE_TAG, "scan start success at time: %d:%d:%d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
         // if (timeinfo.tm_sec == 0) {  // send alive confirmation every minute
         //   char alive[64] = "/v1.6/devices/";
@@ -338,13 +353,13 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
                 memcpy(beacons[i].instance, instance, 6);
                 sprintf(beacons[i].visitor, "%02x%02x%02x%02x%02x%02x", instance[0],
                               instance[1], instance[2], instance[3], instance[4], instance[5]);
-                ESP_LOGI(WIFI_TAG, "Updated visitor ID: %s on beacon address: %s", beacons[i].visitor, beacons[i].address);
+                ESP_LOGI(MAIN_TAG, "Updated visitor ID: %s on beacon address: %s", beacons[i].visitor, beacons[i].address);
                 cJSON *root = cJSON_CreateObject();
                 cJSON_AddStringToObject(root, "address", beacons[i].address);
                 cJSON_AddStringToObject(root, "id", beacons[i].visitor);
                 cJSON_AddNumberToObject(root, "timestamp", start);
                 if( xQueueSendToBack( beacons_queue, &root, ( TickType_t ) 10 ) != pdPASS ) {
-                  ESP_LOGW(WIFI_TAG, "Could not add beacon ID to queue! Restarting!");
+                  ESP_LOGW(MAIN_TAG, "Could not add beacon ID to queue! Restarting!");
                   esp_restart(); // probably could not reconnect to WiFi
                 }
               }
@@ -364,7 +379,7 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
               // adv_name = esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
               //                                     ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
               // strncpy(beacons[beacons_counter].name, (char *)adv_name, adv_name_len);
-              ESP_LOGI(WIFI_TAG, "New visitor ID: %s on beacon address: %s", beacons[beacons_counter].visitor, beacons[beacons_counter].address);
+              ESP_LOGI(MAIN_TAG, "New visitor ID: %s on beacon address: %s", beacons[beacons_counter].visitor, beacons[beacons_counter].address);
               beacons[beacons_counter].sumRSSI = scan_result->scan_rst.rssi;
               beacons[beacons_counter].times_found = 1;
               // beacons[beacons_counter].groupID = ((uint16_t) *instance << 8) | *(instance+1); // first two bytes of instance
@@ -380,7 +395,7 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
               cJSON_AddStringToObject(root, "id", beacons[beacons_counter].visitor);
               cJSON_AddNumberToObject(root, "timestamp", start);
               if( xQueueSendToBack( beacons_queue, &root, ( TickType_t ) 10 ) != pdPASS ) {
-                ESP_LOGE(WIFI_TAG, "Could not add beacon ID to queue! Restarting!");
+                ESP_LOGE(MAIN_TAG, "Could not add beacon ID to queue! Restarting!");
                 esp_restart(); // probably could not reconnect to WiFi
               }
 
@@ -419,7 +434,7 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
 
             ESP_LOGI(BLE_TAG, "Found %d VIDA! beacons", dp_counter);
             if( xQueueSendToBack( results_queue, &root, ( TickType_t ) 10 ) != pdPASS ) {
-              ESP_LOGW(WIFI_TAG, "Could not add JSON to queue! Restarting!");
+              ESP_LOGE(MAIN_TAG, "Could not add JSON to queue! Restarting!");
               esp_restart(); // probably could not reconnect to WiFi
             }
 
@@ -469,8 +484,9 @@ static void initialize_wifi(void)
     ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = EXAMPLE_WIFI_SSID,
-            .password = EXAMPLE_WIFI_PASS,
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .channel = WIFI_CHANNEL,
         },
     };
     ESP_LOGI(WIFI_TAG, "Setting WiFi configuration SSID %s...", wifi_config.sta.ssid);
@@ -480,9 +496,17 @@ static void initialize_wifi(void)
 
 static void initialize_sntp(void)
 {
-    ESP_LOGI(WIFI_TAG, "Initializing SNTP");
+    ESP_LOGI(MAIN_TAG, "Initializing SNTP");
     sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "time.fi.muni.cz");
+    // sntp_setservername(0, "time.fi.muni.cz");
+    // sntp_setservername(1, "pool.ntp.org");
+    // sntp_setservername(2, "europe.pool.ntp.org");
+    // sntp_setservername(3, "cz.pool.ntp.org");
+    ip_addr_t IP;
+    IP_ADDR4(&IP, 192, 168, 0, 99);
+    sntp_setserver(0, &IP);
+    sntp_setservername(1, "time.fi.muni.cz");
+    sntp_setservername(2, "cz.pool.ntp.org");
     sntp_init();
 }
 
@@ -523,17 +547,30 @@ static void initialize_ble(void) {
 
 static esp_err_t event_handler(void *ctx, system_event_t *event)
 {
+    static bool onceConnected;
+    static uint8_t initialDisconnections;
     switch(event->event_id) {
     case SYSTEM_EVENT_STA_START:
-        esp_wifi_connect();
+        ESP_ERROR_CHECK(esp_wifi_connect());
         break;
     case SYSTEM_EVENT_STA_GOT_IP:
+        onceConnected = true;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
         esp_mqtt_start(MQTT_HOST, MQTT_PORT_CHAR, MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);
         break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
         /* This is a workaround as ESP32 WiFi libs don't currently
            auto-reassociate. */
+        ESP_LOGE(WIFI_TAG, "Disconnected from WIFI");
+        if (onceConnected) {
+          esp_restart();
+        } else {
+          initialDisconnections++;
+          if (initialDisconnections > DISCONNECTIONS_LIMIT) {
+            esp_restart();
+          }
+        }
+
         esp_mqtt_stop();
         esp_wifi_connect();
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
@@ -554,8 +591,11 @@ static void obtain_time(void)
     struct tm timeinfo = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     int retry = 0;
     const int retry_count = 10;
-    while(timeinfo.tm_year < (2016 - 1900) && ++retry < retry_count) {
-        ESP_LOGI(WIFI_TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
+    while(timeinfo.tm_year < (2016 - 1900) && ++retry <= retry_count) {
+        if (retry == retry_count) {
+          esp_restart();
+        }
+        ESP_LOGI(MAIN_TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
         vTaskDelay(2000 / portTICK_PERIOD_MS);
         time(&now);
         localtime_r(&now, &timeinfo);
@@ -579,8 +619,33 @@ static void obtain_time(void)
 //     return client;
 // }
 
+static void restart_timer_callback(void* arg)
+{
+  ESP_LOGI(TIMER_TAG, "Planned restart!");
+  esp_restart();
+}
+
 void app_main()
 {
+    ESP_LOGI(MAIN_TAG, "This is %s observer", MQTT_CLIENT_ID);
+    ESP_LOGI(MAIN_TAG, "Application version: %s", APP_VERSION);
+    // timer for planned restart
+    const esp_timer_create_args_t restart_timer_args = {
+      .callback = &restart_timer_callback,
+      .name = "restart"
+    };
+
+    float random = (float) esp_random();
+    random = random / UINT32_MAX;
+    random = random * RESTART_WINDOW_SEC;
+    int64_t restart_value = (int64_t) random + RESTART_MIN_SEC;
+    restart_value *= 1000000;
+    ESP_LOGI(TIMER_TAG, "Restart value: %lld", restart_value);
+    esp_timer_handle_t restart_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&restart_timer_args, &restart_timer));
+    ESP_ERROR_CHECK(esp_timer_start_once(restart_timer, restart_value));
+
+
     // Initialize NVS.
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES) {
@@ -590,7 +655,7 @@ void app_main()
     ESP_ERROR_CHECK( ret );
 
 
-    esp_mqtt_init(status_callback, message_callback, 256, 2000);
+    esp_mqtt_init(status_callback, message_callback, 256, MQTT_COMMAND_TIMEOUT);
     initialize_wifi();
     ESP_ERROR_CHECK( esp_wifi_start() );
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
@@ -608,7 +673,7 @@ void app_main()
     localtime_r(&now, &timeinfo);
     // Is time set? If not, tm_year will be (1970 - 1900).
     if (timeinfo.tm_year < (2018 - 1900)) {
-      ESP_LOGI(WIFI_TAG, "Time is not set yet. Connecting to WiFi and getting time over NTP.");
+      ESP_LOGI(MAIN_TAG, "Time is not set yet. Connecting to WiFi and getting time over NTP.");
       obtain_time();
       // update 'now' variable with current time
       time(&now);
@@ -619,18 +684,18 @@ void app_main()
     tzset();
     localtime_r(&now, &timeinfo);
     strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-    ESP_LOGI(WIFI_TAG, "The current date/time in Brno is: %s.", strftime_buf);
+    ESP_LOGI(MAIN_TAG, "The current date/time in Brno is: %s.", strftime_buf);
 
     initialize_ble();
 
     results_queue = xQueueCreate(120, sizeof(cJSON *));
     if (results_queue == 0) {
-      ESP_LOGI(WIFI_TAG, "Could not allocate a results queue!");
+      ESP_LOGI(MAIN_TAG, "Could not allocate a results queue!");
     }
 
     beacons_queue = xQueueCreate(120, sizeof(cJSON *));
     if (beacons_queue == 0) {
-      ESP_LOGI(WIFI_TAG, "Could not allocate a beacons queue!");
+      ESP_LOGI(MAIN_TAG, "Could not allocate a beacons queue!");
     }
 
     // set ble scan parameters and start scanning afterwards
@@ -643,7 +708,7 @@ void app_main()
     xTaskCreatePinnedToCore(publish_task, "Publish", 3000, NULL, tskIDLE_PRIORITY, NULL, 1);
     // ESP_LOGI(BLE_TAG, "Free heap size: %d", xPortGetFreeHeapSize());
 
-    ESP_LOGI(BLE_TAG, "Main finished!");
+    ESP_LOGI(MAIN_TAG, "Main finished!");
 
     // const int deep_sleep_sec = 10;
     // ESP_LOGI(WIFI_TAG, "Entering deep sleep for %d seconds", deep_sleep_sec);
