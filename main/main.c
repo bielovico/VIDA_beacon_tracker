@@ -19,6 +19,7 @@
 #include "esp_attr.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -29,11 +30,10 @@
 #include "apps/sntp/sntp.h"
 
 #include <esp_mqtt.h>
-// #include "mqtt_client.h"
 
 #include "cJSON.h"
 
-#define APP_VERSION "0.9"
+#define APP_VERSION "0.9.2" // Safe publish definition
 
 #define MAIN_TAG "MAIN"
 #define BLE_TAG "BLE"
@@ -46,9 +46,10 @@
 #define WIFI_SSID "OlVeHotspot"
 #define WIFI_PASS "1ViBDzr1ZK"
 #define WIFI_CHANNEL 4
-#define DISCONNECTIONS_LIMIT 15
-// #define WIFI_SSID "wifi-free"
-// #define WIFI_PASS ""
+#define DISCONNECTIONS_LIMIT 30
+
+// #define TIME_SYNC_INTERVAL 30000  // in milliseconds
+// #define TIME_SYNC_WINDOW 5000  // in milliseconds
 
 // IBM MQTT credentials: token rgpCKDpsJA76OgV7zI
 // #define MQTT_HOST "mqtt://p28mg8.messaging.internetofthings.ibmcloud.com"
@@ -68,42 +69,44 @@
 // #define MQTT_CLIENT_ID "ESP32:Office:Testing"
 
 // VIDA mosquitto MQTT credentials
-#define MQTT_HOST "192.168.0.99"
+#define MQTT_HOST "10.0.14.150"
 #define MQTT_USER " "
 #define MQTT_PASS " "
 #define MQTT_PORT 1883
 #define MQTT_PORT_CHAR "1883"
+// used IDs:
+// #define MQTT_CLIENT_ID "office"
 #define MQTT_CLIENT_ID "testing"
+// #define MQTT_CLIENT_ID "civi:ostrov"
+// #define MQTT_CLIENT_ID "civi:lego"
+// #define MQTT_CLIENT_ID "civi:motory"
+// #define MQTT_CLIENT_ID "civi:para"
+// #define MQTT_CLIENT_ID "civi:hluk"
+// #define MQTT_CLIENT_ID "civi:ideal"
+// #define MQTT_CLIENT_ID "civi:stul"
+// #define MQTT_CLIENT_ID "civi:agora"
 
-#define MQTT_COMMAND_TIMEOUT 6000
+#define MQTT_COMMAND_TIMEOUT 12000
+#define MQTT_PUBLISH_DELAY_MS 200
 
-#define RESTART_WINDOW_SEC 1200
-#define RESTART_MIN_SEC    1200
+#define RESTART_WINDOW_SEC 1200  // 20 minutes windows
+#define RESTART_MIN_SEC    3000  // after 50 minutes
 
 /* FreeRTOS event group to signal when we are connected & ready to make a request */
 static EventGroupHandle_t wifi_event_group;
 /* The event group allows multiple bits for each event,
    but we only care about one event - are we connected
    to the AP with an IP? */
-  const int WIFI_CONNECTED_BIT = BIT0;
+const int WIFI_CONNECTED_BIT = BIT0;
 const int MQTT_CONNECTED_BIT = BIT1;
-/* Variable holding number of times ESP32 restarted since first boot.
- * It is placed into RTC memory using RTC_DATA_ATTR and
- * maintains its value when ESP32 wakes from deep sleep.
- */
-// RTC_DATA_ATTR static int boot_count = 0;
-
-// esp_mqtt_client_handle_t mqttclient;
 
 static const uint8_t bit16_UUID_Eddystone[2] = {0xaa, 0xfe};
 static const uint8_t service_data_EddystoneUID[3] = {0xaa, 0xfe, 0x00};
 static const uint8_t name_space_VIDA[10] = {0xec, 0x0c, 0xb4, 0xca, 0x9f, 0xa6, 0x84, 0xd6, 0xab, 0xbf};
 static const uint8_t duration = 2;
 
-
 // queue of JSON results
 QueueHandle_t results_queue;
-
 // queue of beacon IDs
 QueueHandle_t beacons_queue;
 
@@ -145,7 +148,7 @@ typedef struct VIDABeacon {
 } VIDABeacon;
 
 
-// MQTT callback functions for esp_mqtt.h
+// MQTT callback functions
 static void status_callback(esp_mqtt_status_t status) {
   switch (status) {
     case ESP_MQTT_STATUS_CONNECTED:
@@ -153,10 +156,12 @@ static void status_callback(esp_mqtt_status_t status) {
       xEventGroupSetBits(wifi_event_group, MQTT_CONNECTED_BIT);
       break;
     case ESP_MQTT_STATUS_DISCONNECTED:
-      // reconnect
-      ESP_LOGI(MQTT_TAG, "Disconnected from broker. Reconnecting.");
-      esp_mqtt_start(MQTT_HOST, MQTT_PORT_CHAR, MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);
       xEventGroupClearBits(wifi_event_group, MQTT_CONNECTED_BIT);
+      // reconnect
+      ESP_LOGI(MQTT_TAG, "Disconnected from broker. Reconnecting when on wifi.");
+      xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
+                          false, true, portMAX_DELAY);
+      esp_mqtt_start(MQTT_HOST, MQTT_PORT_CHAR, MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);
       break;
   }
 }
@@ -165,13 +170,24 @@ static void message_callback(const char *topic, uint8_t *payload, size_t len) {
   ESP_LOGI(MQTT_TAG, "incoming: %s => %s (%d)", topic, payload, (int)len);
 }
 
+static bool safe_publish(const char *topic, uint8_t *payload, size_t len, uint8_t QoS, bool retained) {
+  bool published = esp_mqtt_publish(topic, payload, len, QoS, retained);
+  while (!published) {
+    ESP_LOGI(MQTT_TAG, "Couldn`t publish, try again after reconnecting!");
+    xEventGroupWaitBits(wifi_event_group, MQTT_CONNECTED_BIT,
+                        false, true, portMAX_DELAY);
+    published = esp_mqtt_publish(topic, payload, len, QoS, retained);
+    // ESP_LOGI(MQTT_TAG, "Tried publishing again.");
+  }
+  return true;
+}
+
 static void publish_task(void * pvParameters) {
   char topic[64] = "observers/";
   strcat(topic, MQTT_CLIENT_ID);
   strcat(topic, "/observations");
   char beacon_topic[64];
   cJSON *beacon_address;
-  bool published;
   cJSON *result;
   char *out;
   BaseType_t xStatus;
@@ -179,17 +195,8 @@ static void publish_task(void * pvParameters) {
   for ( ; ; ) {
     xStatus = xQueueReceive( results_queue, &result, xTicksToWait );
     if (xStatus == pdPASS) {
-      // esp_mqtt_client_publish(mqttclient, "/v1.6/devices/ESP32:office", out, strlen(out), 2, false);
       out = cJSON_Print(result);
-      // ESP_LOGI(MQTT_TAG, "Json length: %d\nJson: %s", strlen(out), out);
-      published = esp_mqtt_publish(topic, (uint8_t *)out, strlen(out), 1, true);
-      while (!published) {
-        ESP_LOGI(MQTT_TAG, "Couldn`t publish, try again after reconnecting!");
-        xEventGroupWaitBits(wifi_event_group, MQTT_CONNECTED_BIT,
-                            false, true, portMAX_DELAY);
-        published = esp_mqtt_publish(topic, (uint8_t *)out, strlen(out), 1, true);
-        // ESP_LOGI(MQTT_TAG, "Tried publishing again.");
-      }
+      safe_publish(topic, (uint8_t *)out, strlen(out), 1, true);
       ESP_LOGI(MQTT_TAG, "Published! %s", out);
       cJSON_Delete(result);
     }
@@ -201,20 +208,23 @@ static void publish_task(void * pvParameters) {
       strcat(beacon_topic, beacon_address->valuestring);
       strcat(beacon_topic, "/visitors");
       out = cJSON_Print(result);
-      // ESP_LOGI(MQTT_TAG, "Json length: %d\nJson: %s", strlen(out), out);
-      published = esp_mqtt_publish(beacon_topic, (uint8_t *)out, strlen(out), 1, true);
-      while (!published) {
-        ESP_LOGI(MQTT_TAG, "Couldn`t publish beacon ID, try again after reconnecting!");
-        xEventGroupWaitBits(wifi_event_group, MQTT_CONNECTED_BIT,
-                            false, true, portMAX_DELAY);
-        published = esp_mqtt_publish(beacon_topic, (uint8_t *)out, strlen(out), 1, true);
-        // ESP_LOGI(MQTT_TAG, "Tried publishing again.");
-      }
+      safe_publish(beacon_topic, (uint8_t *)out, strlen(out), 1, true);
       ESP_LOGI(MQTT_TAG, "Published to topic: %s! %s", beacon_topic, out);
       cJSON_Delete(result);
+      vTaskDelay(MQTT_PUBLISH_DELAY_MS);  // when bulk-loading (e.g. after disconnection recovery), BLE would trigger wdt, giving some time for BLE to work with antenna
     }
   }
 }
+
+// static void sync_task(void * pvParameters) {
+//   for ( ; ; ) {
+//     sntp_init();
+//     ESP_LOGI(MAIN_TAG, "Time sync");
+//     vTaskDelay(TIME_SYNC_WINDOW);
+//     sntp_stop();
+//     vTaskDelay(TIME_SYNC_INTERVAL - TIME_SYNC_WINDOW);
+//   }
+// }
 
 // static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 // {
@@ -434,8 +444,11 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
 
             ESP_LOGI(BLE_TAG, "Found %d VIDA! beacons", dp_counter);
             if( xQueueSendToBack( results_queue, &root, ( TickType_t ) 10 ) != pdPASS ) {
-              ESP_LOGE(MAIN_TAG, "Could not add JSON to queue! Restarting!");
-              esp_restart(); // probably could not reconnect to WiFi
+              ESP_LOGE(MAIN_TAG, "Could not add JSON to queue! Waiting for MQTT connection!");
+              ESP_ERROR_CHECK(esp_wifi_disconnect());
+              xEventGroupWaitBits(wifi_event_group, MQTT_CONNECTED_BIT,
+                                  false, true, portMAX_DELAY);
+              // esp_restart(); // probably could not reconnect to WiFi
             }
 
             time(&now);
@@ -503,7 +516,7 @@ static void initialize_sntp(void)
     // sntp_setservername(2, "europe.pool.ntp.org");
     // sntp_setservername(3, "cz.pool.ntp.org");
     ip_addr_t IP;
-    IP_ADDR4(&IP, 192, 168, 0, 99);
+    IP_ADDR4(&IP, 10, 0, 14, 150);
     sntp_setserver(0, &IP);
     sntp_setservername(1, "time.fi.muni.cz");
     sntp_setservername(2, "cz.pool.ntp.org");
@@ -551,6 +564,7 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
     static uint8_t initialDisconnections;
     switch(event->event_id) {
     case SYSTEM_EVENT_STA_START:
+        // ESP_LOGI(WIFI_TAG, "Started WIFI, trying to connect.");
         ESP_ERROR_CHECK(esp_wifi_connect());
         break;
     case SYSTEM_EVENT_STA_GOT_IP:
@@ -563,18 +577,35 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
            auto-reassociate. */
         ESP_LOGE(WIFI_TAG, "Disconnected from WIFI");
         if (onceConnected) {
-          esp_restart();
+          ESP_ERROR_CHECK(esp_wifi_stop());
+          vTaskDelay(1000);
+          ESP_ERROR_CHECK(esp_wifi_start());
+          onceConnected = false;
+          initialDisconnections = 0;
+          // esp_restart();
         } else {
           initialDisconnections++;
           if (initialDisconnections > DISCONNECTIONS_LIMIT) {
-            esp_restart();
+            ESP_ERROR_CHECK(esp_wifi_stop());
+            vTaskDelay(1000);
+            ESP_ERROR_CHECK(esp_wifi_start());
+            onceConnected = false;
+            initialDisconnections = 0;
+          } else {
+            ESP_ERROR_CHECK(esp_wifi_connect());
           }
         }
-
-        esp_mqtt_stop();
-        esp_wifi_connect();
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
         xEventGroupClearBits(wifi_event_group, MQTT_CONNECTED_BIT);
+        break;
+    case SYSTEM_EVENT_STA_LOST_IP:
+        ESP_ERROR_CHECK(esp_wifi_stop());
+        vTaskDelay(1000);
+        ESP_ERROR_CHECK(esp_wifi_start());
+        onceConnected = false;
+        initialDisconnections = 0;
+        break;
+    case SYSTEM_EVENT_STA_STOP:
         break;
     default:
         break;
@@ -600,6 +631,7 @@ static void obtain_time(void)
         time(&now);
         localtime_r(&now, &timeinfo);
     }
+    // sntp_stop();
 }
 
 // static esp_mqtt_client_handle_t mqtt_app_start(void)
@@ -622,11 +654,18 @@ static void obtain_time(void)
 static void restart_timer_callback(void* arg)
 {
   ESP_LOGI(TIMER_TAG, "Planned restart!");
+  ESP_ERROR_CHECK(esp_wifi_stop());
+  ESP_ERROR_CHECK(esp_wifi_deinit());
   esp_restart();
+  // esp_wifi_stop();
+  // esp_wifi_start();
 }
 
 void app_main()
 {
+    esp_log_level_set("wifi", ESP_LOG_VERBOSE);
+    esp_log_level_set("BT_HCI", ESP_LOG_NONE);
+
     ESP_LOGI(MAIN_TAG, "This is %s observer", MQTT_CLIENT_ID);
     ESP_LOGI(MAIN_TAG, "Application version: %s", APP_VERSION);
     // timer for planned restart
@@ -639,12 +678,11 @@ void app_main()
     random = random / UINT32_MAX;
     random = random * RESTART_WINDOW_SEC;
     int64_t restart_value = (int64_t) random + RESTART_MIN_SEC;
+    ESP_LOGI(TIMER_TAG, "Planned restart after %lld minutes and %lld seconds. (Total %lld seconds)", restart_value/60, restart_value%60, restart_value);
     restart_value *= 1000000;
-    ESP_LOGI(TIMER_TAG, "Restart value: %lld", restart_value);
     esp_timer_handle_t restart_timer;
     ESP_ERROR_CHECK(esp_timer_create(&restart_timer_args, &restart_timer));
-    ESP_ERROR_CHECK(esp_timer_start_once(restart_timer, restart_value));
-
+    ESP_ERROR_CHECK(esp_timer_start_periodic(restart_timer, restart_value));
 
     // Initialize NVS.
     esp_err_t ret = nvs_flash_init();
@@ -706,6 +744,7 @@ void app_main()
 
 
     xTaskCreatePinnedToCore(publish_task, "Publish", 3000, NULL, tskIDLE_PRIORITY, NULL, 1);
+    // xTaskCreatePinnedToCore(sync_task, "Periodic time sync", 3000, NULL, tskIDLE_PRIORITY, NULL, 1);
     // ESP_LOGI(BLE_TAG, "Free heap size: %d", xPortGetFreeHeapSize());
 
     ESP_LOGI(MAIN_TAG, "Main finished!");
