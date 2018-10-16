@@ -19,6 +19,7 @@
 #include "esp_attr.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
+// #include "esp_heap_trace.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -33,7 +34,7 @@
 
 #include "cJSON.h"
 
-#define APP_VERSION "0.9.2" // Safe publish definition
+#define APP_VERSION "0.9.3" // batch publishing
 
 #define MAIN_TAG "MAIN"
 #define BLE_TAG "BLE"
@@ -85,12 +86,22 @@
 // #define MQTT_CLIENT_ID "civi:ideal"
 // #define MQTT_CLIENT_ID "civi:stul"
 // #define MQTT_CLIENT_ID "civi:agora"
+// #define MQTT_CLIENT_ID "mikro:dna"
+// #define MQTT_CLIENT_ID "detske:veza"
 
-#define MQTT_COMMAND_TIMEOUT 12000
-#define MQTT_PUBLISH_DELAY_MS 200
+#define MQTT_COMMAND_TIMEOUT  6000
+#define MQTT_PUBLISH_DELAY_MS 500
+#define MQTT_MESSAGE_LIMIT    5120  // MQTT protocol max 268435455
 
 #define RESTART_WINDOW_SEC 1200  // 20 minutes windows
-#define RESTART_MIN_SEC    3000  // after 50 minutes
+#define RESTART_MIN_SEC    6600  // after 110 minutes
+
+#define RESULTS_QUEUE_SIZE 30
+#define BEACONS_QUEUE_SIZE 50
+
+
+// #define NUM_RECORDS 100
+// static heap_trace_record_t trace_record[NUM_RECORDS]; // This buffer must be in internal RAM
 
 /* FreeRTOS event group to signal when we are connected & ready to make a request */
 static EventGroupHandle_t wifi_event_group;
@@ -163,7 +174,7 @@ static void status_callback(esp_mqtt_status_t status) {
                           false, true, portMAX_DELAY);
       esp_mqtt_start(MQTT_HOST, MQTT_PORT_CHAR, MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);
       break;
-  }
+    }
 }
 
 static void message_callback(const char *topic, uint8_t *payload, size_t len) {
@@ -187,18 +198,37 @@ static void publish_task(void * pvParameters) {
   strcat(topic, MQTT_CLIENT_ID);
   strcat(topic, "/observations");
   char beacon_topic[64];
-  cJSON *beacon_address;
-  cJSON *result;
+  cJSON *beacon_address = NULL;
+  cJSON *result = NULL;
+  cJSON *results = cJSON_CreateArray();
+  size_t len = 0;
+  size_t full_len = 2;
   char *out;
   BaseType_t xStatus;
   const TickType_t xTicksToWait = pdMS_TO_TICKS( 5000 );
+  // ESP_ERROR_CHECK( heap_trace_start(HEAP_TRACE_LEAKS) );
   for ( ; ; ) {
     xStatus = xQueueReceive( results_queue, &result, xTicksToWait );
     if (xStatus == pdPASS) {
-      out = cJSON_Print(result);
-      safe_publish(topic, (uint8_t *)out, strlen(out), 1, true);
-      ESP_LOGI(MQTT_TAG, "Published! %s", out);
-      cJSON_Delete(result);
+      out = cJSON_PrintUnformatted(result);
+      len = strlen(out);
+      cJSON_free(out);
+      if (full_len + (len + 1) < MQTT_MESSAGE_LIMIT) {
+        cJSON_AddItemToArray(results, result);
+        full_len += (len + 1);
+      } else {
+        out = cJSON_PrintUnformatted(results);
+        safe_publish(topic, (uint8_t *)out, strlen(out), 1, true);
+        // ESP_LOGI(MQTT_TAG, "Published! (%d) %s", strlen(out), out);
+        ESP_LOGI(MQTT_TAG, "Published!");
+        cJSON_Delete(results);
+        results = cJSON_CreateArray();
+        cJSON_AddItemToArray(results, result);
+        full_len = len + 2;
+        cJSON_free(out);
+        // ESP_ERROR_CHECK( heap_trace_stop() );
+        // heap_trace_dump();
+      }
     }
     xStatus = xQueueReceive( beacons_queue, &result, ( TickType_t ) 10);
     if (xStatus == pdPASS) {
@@ -211,8 +241,9 @@ static void publish_task(void * pvParameters) {
       safe_publish(beacon_topic, (uint8_t *)out, strlen(out), 1, true);
       ESP_LOGI(MQTT_TAG, "Published to topic: %s! %s", beacon_topic, out);
       cJSON_Delete(result);
-      vTaskDelay(MQTT_PUBLISH_DELAY_MS);  // when bulk-loading (e.g. after disconnection recovery), BLE would trigger wdt, giving some time for BLE to work with antenna
+      cJSON_free(out);
     }
+    vTaskDelay(MQTT_PUBLISH_DELAY_MS);  // when bulk-loading (e.g. after disconnection recovery), BLE would trigger wdt, giving some time for BLE to work with antenna
   }
 }
 
@@ -224,57 +255,6 @@ static void publish_task(void * pvParameters) {
 //     sntp_stop();
 //     vTaskDelay(TIME_SYNC_INTERVAL - TIME_SYNC_WINDOW);
 //   }
-// }
-
-// static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
-// {
-//     mqttclient = event->client;
-//     // int msg_id;
-//     // your_context_t *context = event->context;
-//     switch (event->event_id) {
-//         case MQTT_EVENT_CONNECTED:
-//             ESP_LOGI(MQTT_TAG, "MQTT_EVENT_CONNECTED");
-//             cJSON *root = NULL;
-//             char *out = NULL;
-//             root = cJSON_CreateObject();
-//             cJSON_AddItemToObject(root, "rssi", cJSON_CreateNumber(-81));
-//             out = cJSON_Print(root);
-//             esp_mqtt_client_publish(mqttclient, "/v1.6/devices/ESP32:office", out, strlen(out), 2, false);
-//             // esp_mqtt_client_publish(mqttclient, "iot-2/evt/testing/fmt/json", out, strlen(out), 2, false);
-//             // msg_id = esp_mqtt_client_subscribe(client, "/topic/qos0", 0);
-//             // ESP_LOGI(MQTT_TAG, "sent subscribe successful, msg_id=%d", msg_id);
-//             //
-//             // msg_id = esp_mqtt_client_subscribe(client, "/topic/qos1", 1);
-//             // ESP_LOGI(MQTT_TAG, "sent subscribe successful, msg_id=%d", msg_id);
-//             //
-//             // msg_id = esp_mqtt_client_unsubscribe(client, "/topic/qos1");
-//             // ESP_LOGI(MQTT_TAG, "sent unsubscribe successful, msg_id=%d", msg_id);
-//             break;
-//         case MQTT_EVENT_DISCONNECTED:
-//             ESP_LOGI(MQTT_TAG, "MQTT_EVENT_DISCONNECTED");
-//             break;
-//
-//         case MQTT_EVENT_SUBSCRIBED:
-//             ESP_LOGI(MQTT_TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
-//             // msg_id = esp_mqtt_client_publish(client, "/topic/qos0", "data", 0, 0, 0);
-//             // ESP_LOGI(MQTT_TAG, "sent publish successful, msg_id=%d", msg_id);
-//             break;
-//         case MQTT_EVENT_UNSUBSCRIBED:
-//             ESP_LOGI(MQTT_TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
-//             break;
-//         case MQTT_EVENT_PUBLISHED:
-//             ESP_LOGI(MQTT_TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
-//             break;
-//         case MQTT_EVENT_DATA:
-//             ESP_LOGI(MQTT_TAG, "MQTT_EVENT_DATA");
-//             printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
-//             printf("DATA=%.*s\r\n", event->data_len, event->data);
-//             break;
-//         case MQTT_EVENT_ERROR:
-//             ESP_LOGI(MQTT_TAG, "MQTT_EVENT_ERROR");
-//             break;
-//     }
-//     return ESP_OK;
 // }
 
 static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
@@ -290,7 +270,8 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
     time_t now;
     struct tm timeinfo;
 
-    static uint64_t start = 0;
+    // static uint64_t start = 0;
+    static uint32_t start = 0;
     static VIDABeacon beacons[50];
     static uint8_t beacons_counter = 0;
     uint8_t dp_counter = 0;
@@ -317,9 +298,11 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         dp_counter = 0;
         time(&now);
         localtime_r(&now, &timeinfo);
-        start = (uint64_t) now;
+        start = (uint32_t) now;
+        // start = (uint64_t) now;
         // start *= 1000; // to get milliseconds
         ESP_LOGI(BLE_TAG, "scan start success at time: %d:%d:%d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        // ESP_LOGI(BLE_TAG, "Free heap size: %d", xPortGetFreeHeapSize());
         // if (timeinfo.tm_sec == 0) {  // send alive confirmation every minute
         //   char alive[64] = "/v1.6/devices/";
         //   strcat(alive, MQTT_CLIENT_ID);
@@ -416,11 +399,14 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         case ESP_GAP_SEARCH_INQ_CMPL_EVT: {
             int averageRSSI;
             cJSON *root = cJSON_CreateObject();
-            cJSON_AddNumberToObject(root, "timestamp", start);
+            char timestamp_string[12];
+            sprintf(timestamp_string, "%d", start);
+            cJSON *timestamp = cJSON_CreateObject();
+            cJSON_AddItemToObject(root, timestamp_string, timestamp);
             cJSON *rssi = cJSON_CreateObject();
             cJSON *times_observed = cJSON_CreateObject();
-            cJSON_AddItemToObject(root, "rssi", rssi);
-            cJSON_AddItemToObject(root, "timesObserved", times_observed);
+            cJSON_AddItemToObject(timestamp, "rssi", rssi);
+            cJSON_AddItemToObject(timestamp, "timesObserved", times_observed);
 
             for (size_t i = 0; i < beacons_counter; i++) {
               if (beacons[i].times_found > 0) {
@@ -445,7 +431,9 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             ESP_LOGI(BLE_TAG, "Found %d VIDA! beacons", dp_counter);
             if( xQueueSendToBack( results_queue, &root, ( TickType_t ) 10 ) != pdPASS ) {
               ESP_LOGE(MAIN_TAG, "Could not add JSON to queue! Waiting for MQTT connection!");
-              ESP_ERROR_CHECK(esp_wifi_disconnect());
+              cJSON_Delete(root);
+              ESP_LOGI(BLE_TAG, "Free heap size: %d", xPortGetFreeHeapSize());
+              // ESP_ERROR_CHECK(esp_wifi_disconnect());
               xEventGroupWaitBits(wifi_event_group, MQTT_CONNECTED_BIT,
                                   false, true, portMAX_DELAY);
               // esp_restart(); // probably could not reconnect to WiFi
@@ -666,6 +654,8 @@ void app_main()
     esp_log_level_set("wifi", ESP_LOG_VERBOSE);
     esp_log_level_set("BT_HCI", ESP_LOG_NONE);
 
+    // ESP_ERROR_CHECK( heap_trace_init_standalone(trace_record, NUM_RECORDS) );
+
     ESP_LOGI(MAIN_TAG, "This is %s observer", MQTT_CLIENT_ID);
     ESP_LOGI(MAIN_TAG, "Application version: %s", APP_VERSION);
     // timer for planned restart
@@ -682,7 +672,7 @@ void app_main()
     restart_value *= 1000000;
     esp_timer_handle_t restart_timer;
     ESP_ERROR_CHECK(esp_timer_create(&restart_timer_args, &restart_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(restart_timer, restart_value));
+    ESP_ERROR_CHECK(esp_timer_start_once(restart_timer, restart_value));
 
     // Initialize NVS.
     esp_err_t ret = nvs_flash_init();
@@ -693,7 +683,7 @@ void app_main()
     ESP_ERROR_CHECK( ret );
 
 
-    esp_mqtt_init(status_callback, message_callback, 256, MQTT_COMMAND_TIMEOUT);
+    esp_mqtt_init(status_callback, message_callback, MQTT_MESSAGE_LIMIT+128, MQTT_COMMAND_TIMEOUT);
     initialize_wifi();
     ESP_ERROR_CHECK( esp_wifi_start() );
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
@@ -726,12 +716,12 @@ void app_main()
 
     initialize_ble();
 
-    results_queue = xQueueCreate(120, sizeof(cJSON *));
+    results_queue = xQueueCreate(RESULTS_QUEUE_SIZE, sizeof(cJSON *));
     if (results_queue == 0) {
       ESP_LOGI(MAIN_TAG, "Could not allocate a results queue!");
     }
 
-    beacons_queue = xQueueCreate(120, sizeof(cJSON *));
+    beacons_queue = xQueueCreate(BEACONS_QUEUE_SIZE, sizeof(cJSON *));
     if (beacons_queue == 0) {
       ESP_LOGI(MAIN_TAG, "Could not allocate a beacons queue!");
     }
